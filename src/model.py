@@ -1,12 +1,184 @@
-# Add old pre-deepseek meta MTP and scale with that
-
 import torch
 import torch.nn as nn
+from torch.fft import fft, ifft
 from torch.nn import functional as F
-import math
-import inspect
-from muon import Muon
+# from muon import Muon # Assuming Muon is a custom optimizer you have; commented out for now
 
+# Your provided FilterBank PE code - This is where it should be
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.signal  # For FIR filter initialization
+
+# Ensure signal is available for _design_fir, even if only for initialization
+try:
+    from scipy import signal
+except ImportError:
+    print("Warning: scipy.signal not found. FIR filter initialization might fail if not overridden.")
+
+
+class LearnableFIRFFT(nn.Module):
+    """FFT-optimized learnable FIR filter."""
+
+    def __init__(self, init_cutoff=0.1, num_taps=101, fs=1.0):
+        super().__init__()
+        self.num_taps = num_taps
+        self.fs = fs
+        self.init_cutoff_val = init_cutoff  # Store for potential visualization
+
+        initial_coeffs = self._design_fir(init_cutoff)
+        self.coeffs = nn.Parameter(
+            torch.from_numpy(initial_coeffs).float()
+        )
+
+    def _design_fir(self, cutoff):
+        """Design windowed-sinc FIR filter (lowpass/bandpass/highpass)."""
+        nyq = self.fs / 2.0
+        # Ensure num_taps is odd for symmetric filter (often desired for linear phase)
+        if self.num_taps % 2 == 0:
+            # print(f"Warning: num_taps ({self.num_taps}) is even. Incrementing to make it odd for symmetric FIR design.")
+            self.num_taps += 1
+
+        if isinstance(cutoff, list):  # Bandpass
+            processed_cutoff = [max(min(c, nyq * 0.999), nyq * 0.001) for c in cutoff]
+            if processed_cutoff[0] >= processed_cutoff[1]:
+                processed_cutoff[0] = processed_cutoff[1] * 0.5
+            return signal.firwin(self.num_taps, processed_cutoff, fs=self.fs, pass_zero=False, window='hann')
+        else:  # Lowpass/Highpass
+            processed_cutoff = max(min(cutoff, nyq * 0.999), nyq * 0.001)
+            is_highpass = processed_cutoff > 0.5 * nyq
+            return signal.firwin(self.num_taps, processed_cutoff, fs=self.fs, pass_zero=not is_highpass, window='hann')
+
+    def forward(self, x):
+        """FFT-based convolution. Input x shape: (batch, length)"""
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+
+        batch_size, input_len = x.shape
+        fft_len = input_len + self.num_taps - 1
+
+        x_pad = torch.nn.functional.pad(x, (0, self.num_taps - 1))
+
+        coeffs_for_fft = torch.zeros(fft_len, device=self.coeffs.device, dtype=self.coeffs.dtype)
+        coeffs_for_fft[:self.num_taps] = self.coeffs
+
+        x_fft = fft(x_pad, n=fft_len, dim=-1)
+        c_fft = fft(coeffs_for_fft, n=fft_len, dim=-1)
+
+        out_fft = x_fft * c_fft.unsqueeze(0)
+        out_ifft = ifft(out_fft, n=fft_len, dim=-1).real
+
+        return out_ifft[..., :input_len]
+
+
+class MultiScalePositionalEncodingOptimized(nn.Module):
+    """Learnable multi-scale positional encoding with FFT optimization on a prototype signal."""
+
+    def __init__(self, num_filters=4, init_cutoffs_list=None, num_taps=101, resolution_steps=512, fs=1.0):
+        super().__init__()
+        self.num_filters = num_filters
+        self.resolution_steps = resolution_steps
+        self.num_taps = num_taps
+
+        if init_cutoffs_list is None:
+            nyq = fs / 2.0
+            default_cutoffs = [0.2 * nyq, [0.3 * nyq, 0.5 * nyq], [0.5 * nyq, 0.75 * nyq], 0.85 * nyq]
+            init_cutoffs_list = default_cutoffs[:num_filters]
+            if len(init_cutoffs_list) < num_filters:
+                init_cutoffs_list.extend([0.5 * nyq] * (num_filters - len(init_cutoffs_list)))
+
+        self.filters = nn.ModuleList([
+            LearnableFIRFFT(init_cutoff=init_cutoffs_list[i], num_taps=num_taps, fs=fs)
+            for i in range(num_filters)
+        ])
+
+        self.register_buffer('proto_dist_base', torch.linspace(0, 1, resolution_steps).unsqueeze(0))
+        self.filtered_proto_features_cache = None
+
+    def _get_filtered_prototypes(self, device):
+        proto_dist = self.proto_dist_base.to(device)
+        filtered_outputs = []
+        for fil_module in self.filters:
+            filtered_outputs.append(fil_module(proto_dist))
+        return torch.cat(filtered_outputs, dim=0).transpose(0, 1)
+
+    def forward(self, d_normalized_indices):
+        current_filter_device = self.filters[0].coeffs.device
+        if self.training or self.filtered_proto_features_cache is None or \
+                self.filtered_proto_features_cache.device != current_filter_device or \
+                self.filtered_proto_features_cache.shape[0] != self.resolution_steps:
+            self.filtered_proto_features_cache = self._get_filtered_prototypes(current_filter_device)
+
+        pos_features = self.filtered_proto_features_cache[d_normalized_indices.reshape(-1)]
+        return pos_features.view(*d_normalized_indices.shape, self.num_filters)
+
+
+class FilterBankAttention(nn.Module):
+    """Transformer attention with learnable multi-scale positional encoding (Optimized PE)."""
+
+    def __init__(self, dim, num_heads=8, num_taps=101, num_pos_filters=4, pos_resolution_steps=512, pos_filter_fs=1.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.to_out = nn.Linear(dim, dim, bias=False)
+
+        self.pos_encoder = MultiScalePositionalEncodingOptimized(
+            num_filters=num_pos_filters,
+            init_cutoffs_list=None,
+            num_taps=num_taps,
+            resolution_steps=pos_resolution_steps,
+            fs=pos_filter_fs
+        )
+        self.pos_proj = nn.Linear(num_pos_filters, num_heads, bias=False)
+        self.pos_resolution_steps = pos_resolution_steps
+
+        self.register_buffer('pos_indices_cache', None)
+        self.cached_seq_len = -1
+
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.shape
+
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: t.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2), qkv)
+
+        if self.cached_seq_len != seq_len or self.pos_indices_cache is None or self.pos_indices_cache.device != x.device:
+            r = torch.arange(seq_len, device=x.device)
+            rel_dist_matrix = torch.abs(r.unsqueeze(0) - r.unsqueeze(1))
+
+            # --- CORRECTED LINE HERE ---
+            max_rel_dist = max(seq_len - 1, 1.0)  # Use Python's max for scalar, ensure float division
+            # --- END OF CORRECTION ---
+
+            norm_rel_dist = rel_dist_matrix / max_rel_dist  # Ensure max_rel_dist is float if rel_dist_matrix is float
+
+            current_pos_indices = (norm_rel_dist * (self.pos_resolution_steps - 1)).round().long()
+            self.pos_indices_cache = torch.clamp(current_pos_indices, 0, self.pos_resolution_steps - 1)
+            self.cached_seq_len = seq_len
+
+        pos_features = self.pos_encoder(self.pos_indices_cache)
+        pos_bias = self.pos_proj(pos_features).permute(2, 0, 1).unsqueeze(0)
+
+        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        attn_logits = attn_logits + pos_bias
+
+        if mask is not None:
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,T) if mask was (T,T) originally
+            elif mask.ndim == 3:
+                mask = mask.unsqueeze(0)
+            attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+
+        attn_weights = attn_logits.softmax(dim=-1)
+
+        out = (attn_weights @ v).transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.to_out(out)
+# End of FilterBank PE code
+
+# --- Config ---
 config = {
     "n_embd": 256,
     "n_head": 16,
@@ -17,416 +189,52 @@ config = {
     "ctx_len": 2048,
     "init_moe_scaling": 1.25,
     "type": ['mlp', 'moe', 'mlp', 'moe'],
-    "device": 'cuda' if torch.cuda.is_available() else 'cpu'
+    "device": 'cuda' if torch.cuda.is_available() else 'cpu',
+    "pos_num_taps": 33,
+    "pos_num_filters": 4,
+    "pos_resolution_steps": 128,
+    "pos_filter_fs": 1.0,
+    "moe_top_k": 2,  # Added for DSMoE
 }
 
-# RoPE
 
-class RoPE(nn.Module):
-    def __init__(self, d, base=100_000_000_000, device=config['device']):
-        super().__init__()
-
-        self.base = base
-        self.d = d
-        self.device = device
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def _build_cache(self, x):
-        if self.cos_cached is not None:
-            return
-
-        head_dim = x.shape[-1]
-
-        theta = 1 / (self.base ** (torch.arange(0, head_dim, 2, device=self.device).float() / self.d))
-        seq_idx = torch.arange(x.shape[0], device=self.device).float()
-        idx_theta = torch.einsum('n,d->nd', seq_idx, theta)
-
-        cos_cache = torch.cos(idx_theta)
-        sin_cache = torch.sin(idx_theta)
-
-        self.cos_cached = torch.cat([cos_cache, cos_cache], dim=-1).unsqueeze(0).unsqueeze(0)
-        self.sin_cached = torch.cat([sin_cache, sin_cache], dim=-1).unsqueeze(0).unsqueeze(0)
-
-    def _neg_half(self, x):
-        head_dim = x.shape[-1]
-        d_2 = head_dim // 2
-        return torch.cat([-x[:, :, :, d_2:], x[:, :, :, :d_2]], dim=-1)
-
-    def forward(self, x):
-        if self.cos_cached is None or self.cos_cached.shape[2] != x.shape[1]:
-            self._build_cache(x)
-
-        x_rope = x.clone()  # VERY IMPORTANT: Create a copy!
-        neg_half_x = self._neg_half(x_rope)
-        x_out = (x_rope * self.cos_cached[:, :, :x.shape[1], :]) + (neg_half_x * self.sin_cached[:, :, :x.shape[1], :])
-        return x_out
-
-def precompute_freqs_cis(dim, end, device, theta=10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
-    t = torch.arange(end, device=device)
-    freqs = torch.outer(t, freqs)
-    return torch.cos(freqs), torch.sin(freqs)
-
-def apply_rope(x: torch.Tensor, y: torch.Tensor, freqs_cis) -> tuple[torch.Tensor,torch.Tensor]:
-    cos_freqs, sin_freqs = freqs_cis
-    seq_len = x.shape[-2]
-
-    cos_seq = cos_freqs[:seq_len]
-    sin_seq = sin_freqs[:seq_len]
-    cos_seq = cos_seq.unsqueeze(0).unsqueeze(0)
-    sin_seq = sin_seq.unsqueeze(0).unsqueeze(0)
-    x_real, x_imag = x.chunk(2, dim=-1)
-    y_real, y_imag = y.chunk(2, dim=-1)
-    x_rotated_real = x_real * cos_seq - x_imag * sin_seq
-    x_rotated_imag = x_real * sin_seq + x_imag * cos_seq
-    y_rotated_real = y_real * cos_seq - y_imag * sin_seq
-    y_rotated_imag = y_real * sin_seq + y_imag * cos_seq
-    x_rotated = torch.cat([x_rotated_real, x_rotated_imag], dim=-1)
-    y_rotated = torch.cat([y_rotated_real, y_rotated_imag], dim=-1)
-    return x_rotated.type_as(x), y_rotated.type_as(y)
-
-# MLA-NSA hybrid, not hardware optimized, just uses NSA sparsity for better training rn
-
-class Attn(nn.Module):
-    """
-    Native Sparse Attention with Multi-headed Latent Attention integration.
-    Combines MLA's compression techniques with NSA's natural sparsity, also better loss
-    """
+class Attn(FilterBankAttention):
     def __init__(self):
-        super().__init__()
-        self.device = config['device']
-        self.n_embd = config['n_embd']
-        self.n_head = config['n_head']
-        self.dropout = config['dropout']
-        self.ctx_len = config['ctx_len']
-        self.rms_norm_eps = config.get('rms_norm_eps', 1e-6)
-
-        # Original MLA parameters
-        self.v_head_dim = 32
-        self.kv_lora_rank = 32
-        self.q_lora_rank = 3 * self.kv_lora_rank
-        self.rope_head_dim = 64
-        self.nope_head_dim = 32
-        self.value_dim = self.n_head * self.v_head_dim
-        self.nope_dim = self.n_head * self.nope_head_dim
-        self.rope_dim = self.n_head * self.rope_head_dim
-
-        # NSA-specific parameters
-        self.block_size = config.get('block_size', 16)  # Size of token blocks for compression
-        self.num_blocks = self.ctx_len // self.block_size
-        self.window_size = config.get('window_size', 128)  # Sliding window size
-        self.num_tokens_to_keep = config.get('num_tokens_to_keep', self.ctx_len // 4)  # Number of fine-grained tokens to keep
-
-        # === Branch 1: Coarse-grained compression branch (adapted from MLA) ===
-        self.compress_q_linear = nn.Linear(self.n_embd, self.q_lora_rank, bias=False)
-        self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=self.rms_norm_eps)
-        self.decompress_q_nope = nn.Linear(self.q_lora_rank, self.nope_dim, bias=False)
-        self.decompress_q_rope = nn.Linear(self.q_lora_rank, self.rope_dim, bias=False)
-
-        self.compress_kv_linear = nn.Linear(self.n_embd, self.kv_lora_rank, bias=False)
-        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=self.rms_norm_eps)
-        self.decompress_k_nope = nn.Linear(self.kv_lora_rank, self.nope_dim, bias=False)
-        self.decompress_v_linear = nn.Linear(self.kv_lora_rank, self.value_dim, bias=False)
-        self.k_rope_linear = nn.Linear(self.n_embd, self.rope_head_dim, bias=False)
-
-        # === Branch 2: Token Selection Branch (NSA) ===
-        # Components for importance-based token selection
-        self.importance_scorer = nn.Linear(self.n_embd, 1,bias=False)
-        # Independent KV for selected tokens
-        self.selection_k = nn.Linear(self.n_embd, self.n_head * (self.rope_head_dim + self.nope_head_dim), bias=False)
-        self.selection_v = nn.Linear(self.n_embd, self.value_dim, bias=False)
-
-        # === Branch 3: Sliding Window Branch (NSA) ===
-        # Independent KV for sliding window
-        self.window_k = nn.Linear(self.n_embd, self.n_head * (self.rope_head_dim + self.nope_head_dim), bias=False)
-        self.window_v = nn.Linear(self.n_embd, self.value_dim, bias=False)
-
-        # Token Compression Mechanism (NSA)
-        self.block_compressor = nn.Sequential(
-            nn.Linear(self.block_size * self.n_embd, 4 * self.n_embd,bias=False),
-            nn.GELU(),
-            nn.Linear(4 * self.n_embd, self.n_embd,bias=False)
+        super().__init__(
+            dim=config['n_embd'],
+            num_heads=config['n_head'],
+            num_taps=config['pos_num_taps'],
+            num_pos_filters=config['pos_num_filters'],
+            pos_resolution_steps=config['pos_resolution_steps'],
+            pos_filter_fs=config['pos_filter_fs']
         )
-
-        # Intra-block position encoding
-        self.intra_block_pos_encoding = nn.Parameter(
-            torch.randn(1, self.block_size, self.n_embd)
-        )
-
-        # Gated Multi-Branch Integration (NSA)
-        self.branch_gate = nn.Linear(self.n_embd, 3,bias=False)  # 3 gates for 3 branches
-
-        # Output projection
-        self.proj = nn.Linear(self.value_dim, self.n_embd, bias=False)
-        self.res_dropout = nn.Dropout(p=self.dropout)
-
-        # Caching for inference
-        self.k_cache = None
-        self.v_cache = None
-        self.cache_filled = 0
-
-        # RoPE
-        self.rope = RoPE(self.rope_head_dim, device=self.device)
-        self.freqs_cis = precompute_freqs_cis(self.rope_head_dim, self.ctx_len, self.device)
-
-    def _compress_tokens(self, x):
-        """Token compression mechanism from NSA"""
-        B, T, C = x.size()
-
-        # Ensure T is divisible by block_size for simplicity
-        padded_len = ((T + self.block_size - 1) // self.block_size) * self.block_size
-        if padded_len > T:
-            padding = torch.zeros(B, padded_len - T, C, device=x.device, dtype=x.dtype)
-            x_padded = torch.cat([x, padding], dim=1)
-        else:
-            x_padded = x
-
-        # Add intra-block position encoding
-        blocks = x_padded.view(B, -1, self.block_size, C)
-        pos_encoded_blocks = blocks + self.intra_block_pos_encoding
-
-        # Reshape for compression
-        blocks_flat = pos_encoded_blocks.view(B, -1, self.block_size * C)
-
-        # Apply block compression
-        compressed_blocks = self.block_compressor(blocks_flat)
-
-        return compressed_blocks
-
-    def _select_important_tokens(self, x, importance_scores):
-        """Select the most important tokens based on scores"""
-        B, T, _ = x.size()
-
-        # Get indices of top-k tokens by importance
-        _, indices = torch.topk(importance_scores.squeeze(-1),
-                                min(self.num_tokens_to_keep, T),
-                                dim=1)
-
-        # Sort indices to maintain sequence order (continuity-aware)
-        indices, _ = torch.sort(indices, dim=1)
-
-        # Gather selected tokens
-        batch_indices = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, indices.size(1))
-        selected_tokens = x[batch_indices, indices]
-
-        return selected_tokens, indices
-
-    def _get_sliding_window_tokens(self, x, current_pos=None):
-        """Extract tokens within the sliding window"""
-        if self.training or current_pos is None:
-            # During training, we can use the whole sequence with windowed attention
-            return x
-        else:
-            # During inference, get a window centered around the current position
-            B, T, _ = x.size()
-            window_start = max(0, current_pos - self.window_size // 2)
-            window_end = min(T, window_start + self.window_size)
-            return x[:, window_start:window_end]
 
     def forward(self, x):
-        B, T, C = x.size()
-
-        # === Prepare queries using MLA's approach ===
-        compressed_q = self.compress_q_linear(x)
-        norm_q = self.q_norm(compressed_q)
-        query_nope = self.decompress_q_nope(norm_q)
-        query_rope = self.decompress_q_rope(norm_q)
-
-        # Reshape and transpose queries
-        query_nope = query_nope.view(B, T, self.n_head, self.nope_head_dim).transpose(1, 2)
-        query_rope = query_rope.view(B, T, self.n_head, self.rope_head_dim).transpose(1, 2)
-
-        # Apply RoPE to query
-        q_rope, _ = apply_rope(query_rope, query_rope, self.freqs_cis)  # Corrected
-
-        # Recombine query parts
-        q_recombined = torch.empty((B, self.n_head, T, self.rope_head_dim + self.nope_head_dim),
-                                  device=x.device, dtype=x.dtype)
-        q_recombined[:, :, :, :self.nope_head_dim] = query_nope
-        q_recombined[:, :, :, self.nope_head_dim:] = q_rope
-
-        # Compute branch gates for dynamic weighting
-        branch_weights = F.softmax(self.branch_gate(x).mean(dim=1), dim=-1)  # [B, 3]
-
-        # === Branch 1: Coarse-grained compression branch (from MLA) ===
-        compressed_kv = self.compress_kv_linear(x)
-        norm_kv = self.kv_norm(compressed_kv)
-        key_nope_1 = self.decompress_k_nope(norm_kv)
-        value_1 = self.decompress_v_linear(norm_kv)
-        key_rope_1 = self.k_rope_linear(x)
-
-        # Reshape keys and values
-        key_nope_1 = key_nope_1.view(B, T, self.n_head, self.nope_head_dim).transpose(1, 2)
-        key_rope_1 = key_rope_1.view(B, T, 1, self.rope_head_dim).transpose(1, 2)
-        value_1 = value_1.view(B, T, self.n_head, self.v_head_dim).transpose(1, 2)
-
-        # Apply RoPE to keys
-        key_rope_1 = key_rope_1 / self.n_head  # Scale like in original code
-        _, k_rope_1 = apply_rope(key_rope_1, key_rope_1, self.freqs_cis) # Corrected
-
-        # Recombine key parts for branch 1
-        k_recombined_1 = torch.empty((B, self.n_head, T, self.rope_head_dim + self.nope_head_dim),
-                                   device=x.device, dtype=x.dtype)
-        k_recombined_1[:, :, :, :self.nope_head_dim] = key_nope_1
-        k_recombined_1[:, :, :, self.nope_head_dim:] = k_rope_1
-
-        # === Branch 2: Token Selection Branch (NSA) ===
-        # Compute importance scores
-        importance_scores = self.importance_scorer(x)
-
-        # Select important tokens
-        selected_tokens, selected_indices = self._select_important_tokens(x, importance_scores)
-
-        # Get KV for selected tokens
-        B, S, _ = selected_tokens.size()  # S is the number of selected tokens
-        k_selected = self.selection_k(selected_tokens)
-        v_selected = self.selection_v(selected_tokens)
-
-        # Reshape
-        k_selected = k_selected.view(B, S, self.n_head, self.rope_head_dim + self.nope_head_dim).transpose(1, 2)
-        v_selected = v_selected.view(B, S, self.n_head, self.v_head_dim).transpose(1, 2)
-
-        # Apply RoPE (only to the RoPE portion)
-        k_selected_rope = k_selected[:, :, :, self.nope_head_dim:]
-        k_selected_nope = k_selected[:, :, :, :self.nope_head_dim]
-        # Corrected: pass k_selected_rope for both x and y
-        _, k_selected_rope = apply_rope(k_selected_rope, k_selected_rope, self.freqs_cis)
+        B, T, C = x.shape
+        # Create a causal mask for self-attention (True means keep)
+        # Mask shape should be broadcastable to (B, H, T, T) for attn_logits
+        # A (T,T) mask is fine, it will be broadcast.
+        # Or (1,1,T,T)
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        return super().forward(x, mask=causal_mask)
 
 
-        # Recombine
-        k_selected[:, :, :, self.nope_head_dim:] = k_selected_rope
-        k_selected[:, :, :, :self.nope_head_dim] = k_selected_nope  # make sure we add the nope back!
-
-        # === Branch 3: Sliding Window Branch (NSA) ===
-        window_tokens = self._get_sliding_window_tokens(x)
-        B, W, _ = window_tokens.size()  # W is window size
-
-        k_window = self.window_k(window_tokens)
-        v_window = self.window_v(window_tokens)
-
-        # Reshape
-        k_window = k_window.view(B, W, self.n_head, self.rope_head_dim + self.nope_head_dim).transpose(1, 2)
-        v_window = v_window.view(B, W, self.n_head, self.v_head_dim).transpose(1, 2)
-
-        # Apply RoPE (only to the RoPE portion)
-        k_window_rope = k_window[:, :, :, self.nope_head_dim:]
-        k_window_nope = k_window[:, :, :, :self.nope_head_dim]
-         # Corrected: pass k_window_rope for both x and y
-        _, k_window_rope = apply_rope(k_window_rope, k_window_rope, self.freqs_cis)
-
-
-        # Recombine
-        k_window[:, :, :, self.nope_head_dim:] = k_window_rope
-        k_window[:, :, :, :self.nope_head_dim] = k_window_nope
-
-        # === Compute attention for each branch and blend results ===
-        if self.training:
-            self.cache_filled = 0
-
-            # Branch 1: Original MLA attention with full sequence
-            output_1 = F.scaled_dot_product_attention(
-                q_recombined, k_recombined_1, value_1,
-                is_causal=True, dropout_p=self.dropout
-            )
-
-            # Branch 2: Attention with selected tokens
-            # For selected tokens, we need to compute attention differently
-            # as they might not be in sequence order
-            output_2 = F.scaled_dot_product_attention(
-                q_recombined, k_selected, v_selected,
-                is_causal=False, dropout_p=self.dropout  # Non-causal for selected tokens
-            )
-
-            # Branch 3: Sliding window attention
-            output_3 = F.scaled_dot_product_attention(
-                q_recombined, k_window, v_window,
-                is_causal=True, dropout_p=self.dropout
-            )
-
-            # Blend outputs using branch weights
-            blended_output = (
-                output_1 * branch_weights[:, 0].view(B, 1, 1, 1) +
-                output_2 * branch_weights[:, 1].view(B, 1, 1, 1) +
-                output_3 * branch_weights[:, 2].view(B, 1, 1, 1)
-            )
-
-        else:
-            # Inference mode with KV caching
-            if self.k_cache is None or self.v_cache is None or self.k_cache.size(0) != B:
-                self.k_cache = torch.zeros(
-                    B, self.n_head, self.ctx_len, self.rope_head_dim + self.nope_head_dim,
-                    device=self.device, dtype=x.dtype
-                )
-                self.v_cache = torch.zeros(
-                    B, self.n_head, self.ctx_len, self.v_head_dim,
-                    device=self.device, dtype=x.dtype
-                )
-                self.cache_filled = 0
-
-            # Update cache with new tokens
-            new_cache_filled = min(self.cache_filled + T, self.ctx_len)
-
-            # Branch 1: Update cache
-            k_to_cache = k_recombined_1[:, :, :new_cache_filled - self.cache_filled]
-            v_to_cache = value_1[:, :, :new_cache_filled - self.cache_filled]
-
-            self.k_cache[:, :, self.cache_filled:new_cache_filled] = k_to_cache
-            self.v_cache[:, :, self.cache_filled:new_cache_filled] = v_to_cache
-            self.cache_filled = new_cache_filled
-
-            # Get cached KVs
-            k1 = self.k_cache[:, :, :self.cache_filled]
-            v1 = self.v_cache[:, :, :self.cache_filled]
-
-            # Branch 1: Attention with cached KVs
-            output_1 = F.scaled_dot_product_attention(
-                q_recombined, k1, v1, is_causal=True, dropout_p=0
-            )
-
-            # Branch 2: Attention with selected tokens (from current sequence)
-            output_2 = F.scaled_dot_product_attention(
-                q_recombined, k_selected, v_selected, is_causal=False, dropout_p=0
-            )
-
-            # Branch 3: Sliding window attention
-            current_pos = self.cache_filled - 1  # Current position for window centering
-            output_3 = F.scaled_dot_product_attention(
-                q_recombined, k_window, v_window, is_causal=True, dropout_p=0
-            )
-
-            # Blend outputs using branch weights
-            blended_output = (
-                output_1 * branch_weights[:, 0].view(B, 1, 1, 1) +
-                output_2 * branch_weights[:, 1].view(B, 1, 1, 1) +
-                output_3 * branch_weights[:, 2].view(B, 1, 1, 1)
-            )
-
-        # Final processing
-        output = blended_output.transpose(1, 2).contiguous().view(B, T, self.value_dim)
-        output = self.proj(output)
-        output = self.res_dropout(output)
-
-        return output 
-
-# Reg MLP 
-
+# Reg MLP
 class MLP(nn.Module):
     def __init__(self):
         super().__init__()
         n_embd = config['n_embd']
-        self.c_fc    = nn.Linear(n_embd, 4 * n_embd,bias=False)
-        self.c_proj  = nn.Linear(4 * n_embd, n_embd,bias=False)
+        self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
         self.dropout = nn.Dropout(config['dropout'])
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square() # relu sq, not gelu
+        x = F.relu(x).square()
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
-# DS-MoE Layer
 
 class UnitCenteredNoise(nn.Module):
     def __init__(self, scaling=0.02):
@@ -442,58 +250,37 @@ class UnitCenteredNoise(nn.Module):
         else:
             return x
 
+
 class DSMoE(nn.Module):
-
-    def __init__(self, index, num_exp=4):
+    def __init__(self, index, num_exp_routed_to=config['moe_top_k']):
         super().__init__()
-        self.hidden_dim = config['n_embd'] * 2  # was 4, had to shrink by 1/2
-        self.num_experts = config["n_experts"]
-        self.num_exp = num_exp
-        self.moe_scaling = config["init_moe_scaling"]
-        self.experts = nn.ModuleList([MLP() for _ in range(self.num_experts)])
-        self.gate = nn.Sequential(
-            nn.Linear(config['n_embd'], self.num_experts - 1,bias=False),  # exclude shared expert
-            UnitCenteredNoise(scaling=0.02),
-            nn.Softmax(dim=-1)
-        )
-        # Initialize expert bias (excluding the shared expert)
-        self.expert_bias = nn.Parameter(torch.zeros(self.num_experts - 1), requires_grad=False)
+        self.num_total_experts = config["n_experts"]
+        self.num_experts_to_route_to = num_exp_routed_to
 
+        self.experts = nn.ModuleList([MLP() for _ in range(self.num_total_experts)])
+        self.gate = nn.Sequential(
+            nn.Linear(config['n_embd'], self.num_total_experts, bias=False),
+            UnitCenteredNoise(scaling=0.02),
+        )
 
     def forward(self, x):
         b, t, c = x.shape
         x_flat = x.reshape(b * t, c)
+        gate_logits = self.gate(x_flat)
+        gate_probs = F.softmax(gate_logits, dim=-1)
+        top_k_weights, top_k_indices = torch.topk(gate_probs, self.num_experts_to_route_to, dim=-1)
+        top_k_weights_norm = top_k_weights / torch.clamp(top_k_weights.sum(dim=-1, keepdim=True), min=1e-6)  # Normalize
 
-        gate_val_continuous = self.gate(x_flat)
+        router_weights_sparse = torch.zeros(x_flat.size(0), self.num_total_experts, device=x.device,
+                                            dtype=top_k_weights_norm.dtype)
+        router_weights_sparse.scatter_(1, top_k_indices, top_k_weights_norm)
 
-        # Apply expert bias *before* topk
-        biased_gate_vals = gate_val_continuous + self.expert_bias
+        expert_outputs_all = torch.stack([expert(x_flat) for expert in self.experts], dim=0)
+        weighted_expert_outputs = expert_outputs_all * router_weights_sparse.transpose(0, 1).unsqueeze(-1)
+        output_flat = weighted_expert_outputs.sum(dim=0)
 
-        # get top-(num_exp-1) experts excluding the first one
-        gate_vals, gate_val_indices = torch.topk(biased_gate_vals, self.num_exp - 1, dim=-1)
-        gate_vals = gate_vals / gate_vals.sum(dim=-1, keepdim=True)  # normalize
+        return output_flat.reshape(b, t, c), router_weights_sparse
 
-        # prepend the shared expert (index 0) - Corrected handling
-        shared_expert_weight = torch.ones_like(gate_vals[:, :1]) / self.num_exp
-        gate_vals = torch.cat([shared_expert_weight, gate_vals * (self.num_exp - 1) / self.num_exp], dim=-1)
-        gate_val_indices = torch.cat([torch.zeros_like(gate_val_indices[:, :1]), gate_val_indices + 1], dim=-1)
-
-        # process all experts once (fully static)
-        expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=0)  # [num_experts, b*t, c]
-
-        # create routing weights matrix (one-hot * gate values)
-        router_weights = torch.zeros(x_flat.size(0), self.num_experts, device=x.device)
-        for i in range(self.num_exp):
-            idx = gate_val_indices[:, i:i+1]  # [b*t, 1]
-            val = gate_vals[:, i:i+1]  # [b*t, 1]
-            router_weights.scatter_add_(1, idx, val)
-
-        # apply routing weights to expert outputs
-        weighted_outputs = expert_outputs * router_weights.transpose(0, 1).unsqueeze(-1)  # [num_experts, b*t, c]
-        output = weighted_outputs.sum(dim=0)  # [b*t, c]
-
-        # Return both the output and the router_weights
-        return output.reshape(b, t, c), router_weights
 
 class Block(nn.Module):
     def __init__(self, index):
@@ -505,7 +292,7 @@ class Block(nn.Module):
         if self.ffn_type == "mlp":
             self.ffn = MLP()
         elif self.ffn_type == "moe":
-            self.ffn = DSMoE(index)
+            self.ffn = DSMoE(index)  # num_exp_routed_to taken from config['moe_top_k']
         else:
             raise ValueError(f"Invalid layer type: {self.ffn_type}")
 
@@ -513,29 +300,31 @@ class Block(nn.Module):
         self.rm2 = nn.RMSNorm(n_embd)
 
     def forward(self, x):
+        x_attn = self.attn(self.rm1(x))
+        x = x + x_attn
 
-        x = x + self.attn(self.rm1(x))
-        
+        ffn_input = self.rm2(x)
         if self.ffn_type == "moe":
-            x_ffn, router_weights = self.ffn(self.rm2(x))
+            x_ffn, router_weights = self.ffn(ffn_input)
             return x + x_ffn, router_weights
-            
         else:
-            x_ffn = self.ffn(self.rm2(x))
-            return x + x_ffn, None # no MoE, no route weights
+            x_ffn = self.ffn(ffn_input)
+            return x + x_ffn, None
+
 
 class Transformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = config
         self.token_embedding_table = nn.Embedding(config['vocab_size'], config['n_embd'])
-        self.position_embedding_table = nn.Embedding(config['ctx_len'], config['n_embd'])
-        self.blocks = nn.Sequential(*[Block(i) for i in range(config['n_layer'])])
+        self.blocks = nn.ModuleList([Block(i) for i in range(config['n_layer'])])
         self.rm_f = nn.RMSNorm(config['n_embd'])
-        self.lm_head = nn.Linear(config['n_embd'], config['vocab_size'],bias=False)
-        self.token_embedding_table.weight = self.lm_head.weight
+        self.lm_head = nn.Linear(config['n_embd'], config['vocab_size'], bias=False)
+        if config.get('tie_weights', True):  # Add config to control tying
+            self.token_embedding_table.weight = self.lm_head.weight
         self.apply(self._init_weights)
-        self.total_params = sum(p.numel() for p in self.parameters())
+        self.total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Total trainable model parameters: {self.total_params:,}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -547,245 +336,133 @@ class Transformer(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx).clone()
-        pos_emb = self.position_embedding_table(torch.arange(T, device=self.config['device']))
-        x = tok_emb + pos_emb
-
-        all_router_weights = []  # Collect router_weights across MoEs
+        tok_emb = self.token_embedding_table(idx)
+        x = tok_emb
+        all_router_weights = []
 
         for block in self.blocks:
-            x, router_weights = block(x)  # Get router_weights from Block
+            x, router_weights = block(x)
             if router_weights is not None:
                 all_router_weights.append(router_weights)
 
         x = self.rm_f(x)
         logits = self.lm_head(x)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets) 
-
+        loss = None
+        if targets is not None:
+            logits_for_loss = logits.view(-1, logits.size(-1))
+            targets_for_loss = targets.view(-1)
+            loss = F.cross_entropy(logits_for_loss, targets_for_loss)
         return logits, loss, all_router_weights
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, tiktoken_vocab_size=None):
-        """
-        Generates sequences of tokens autoregressively.
-
-        Args:
-            idx (torch.LongTensor): Input sequence indices (shape: B, T).
-            max_new_tokens (int): Maximum number of new tokens to generate.
-            temperature (float): Sampling temperature. Lower values make the distribution
-                                 sharper (less random), higher values make it flatter (more random).
-                                 Must be positive. Defaults to 1.0.
-            top_k (int, optional): If set, only the top_k most probable tokens are considered
-                                   for sampling at each step. Set to None or 0 to disable.
-                                   Defaults to None.
-            tiktoken_vocab_size (int, optional): The vocabulary size of the tokenizer.
-                                                 If provided and smaller than the model's internal
-                                                 vocab_size (config['vocab_size']), tokens with
-                                                 indices >= tiktoken_vocab_size will be masked out
-                                                 during sampling to prevent generating padding tokens.
-                                                 Defaults to None.
-
-        Returns:
-            Tuple[torch.LongTensor, float]:
-                - idx: The generated sequence including the initial prompt (shape: B, T + max_new_tokens).
-                - total_kv_cache_size_gb: Estimated size of the KV cache in GB after generation.
-        """
-        # Ensure temperature is positive
-        if temperature <= 0:
-            # Using temperature=0 often implies greedy sampling (always pick the max logit).
-            # You could implement that explicitly or just use a very small positive value.
-            # For simplicity here, we'll just use a very small value to avoid division by zero
-            # and maintain the sampling structure. Or raise an error.
-            # raise ValueError("Temperature must be positive.")
-            print("Warning: Temperature <= 0. Using a very small value (1e-6) instead.")
-            temperature = 1e-6
-
-        # Determine if vocabulary masking is needed
-        model_vocab_size = config['vocab_size']
-        use_vocab_mask = False
-        effective_vocab_size = model_vocab_size
-        if tiktoken_vocab_size is not None:
-            if tiktoken_vocab_size < model_vocab_size:
-                print(f"generate(): Masking logits for indices >= {tiktoken_vocab_size} (model vocab size: {model_vocab_size})")
-                use_vocab_mask = True
-                effective_vocab_size = tiktoken_vocab_size # For top_k adjustment if needed
-            elif tiktoken_vocab_size > model_vocab_size:
-                 print(f"generate(): Warning - tiktoken_vocab_size ({tiktoken_vocab_size}) > model_vocab_size ({model_vocab_size}). Masking ineffective.")
-            # else: sizes match, no masking needed
-
-
+        self.eval()
         for _ in range(max_new_tokens):
-            # Crop the context if it exceeds the maximum length
-            # Use max() to handle initial prompts shorter than ctx_len
-            start_pos = max(0, idx.size(1) - config['ctx_len'])
-            idx_cond = idx[:, start_pos:] # shape (B, min(T, ctx_len))
+            idx_cond = idx[:, -self.config['ctx_len']:]  # Ensure context windowing
+            logits, _, _ = self(idx_cond)
+            logits = logits[:, -1, :]
 
-            # Forward pass to get logits for the next token
-            # Assuming your model's forward returns (logits, loss, optional_other_data)
-            # Adjust this based on your actual forward method's return signature
-            logits, _, _ = self(idx_cond) # We only need logits here
-
-            # Get the logits for the very last token position
-            logits = logits[:, -1, :] # shape (B, model_vocab_size)
-
-            # Apply temperature scaling
-            logits = logits / temperature
-
-            # --- Apply Vocabulary Masking (before top-k and softmax) ---
-            if use_vocab_mask:
-                 logits[:, tiktoken_vocab_size:] = -float('Inf')
-            # -----------------------------------------------------------
-
-            # --- Apply Top-k Filtering (before softmax) ---
-            if top_k is not None and top_k > 0:
-                # Determine the actual k to use (cannot exceed the number of available logits)
-                # After masking, the effective number might be smaller, but topk handles -inf correctly.
-                k = min(top_k, logits.size(-1)) # Use model_vocab_size as the upper bound
-
-                # Get the top k values and indices for each batch element
-                # We only need the values to find the threshold
-                top_k_values, _ = torch.topk(logits, k=k, dim=-1) # shape (B, k)
-
-                # Find the value of the k-th largest logit (the minimum value in the top-k set)
-                kth_logit_value = top_k_values[:, [-1]] # shape (B, 1)
-
-                # Create a mask for logits less than the k-th largest logit
-                # Set logits below the threshold to negative infinity
-                logits[logits < kth_logit_value] = -float('Inf')
-            # -------------------------------------------------
-
-            # Convert logits to probabilities using softmax
-            probs = F.softmax(logits, dim=-1) # shape (B, model_vocab_size)
-
-            # Sample the next token index from the probability distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # shape (B, 1)
-
-            # Append the newly sampled token index to the sequence
-            idx = torch.cat((idx, idx_next), dim=1) # shape (B, T+1)
-
-        # --- Calculate KV Cache Size (after generation loop) ---
-        total_size_gb = 0
-        # Ensure self.blocks exists and contains your transformer blocks
-        if hasattr(self, 'blocks') and self.blocks is not None:
-            for block in self.blocks:
-                # Check if attention layer and its caches exist
-                if hasattr(block, 'attn') and hasattr(block.attn, 'k_cache') and block.attn.k_cache is not None:
-                    # k_cache size
-                    size_bytes = block.attn.k_cache.numel() * block.attn.k_cache.element_size()
-                    total_size_gb += size_bytes / (1024**3)
-                if hasattr(block, 'attn') and hasattr(block.attn, 'v_cache') and block.attn.v_cache is not None:
-                    # v_cache size
-                    size_bytes = block.attn.v_cache.numel() * block.attn.v_cache.element_size()
-                    total_size_gb += size_bytes / (1024**3)
-        else:
-            print("Warning: Cannot calculate KV cache size. `self.blocks` not found or is None.")
-
-        return idx, total_size_gb
-
-    def configure_optimizers(self, weight_decay, learning_rate, device):
-        """
-        Configures optimizers to use Muon for >=2D parameters WITHIN `self.blocks`
-        (excluding those known not to receive gradients or with requires_grad=False)
-        and AdamW for all other parameters.
-        """
-        muon_params = []
-        adamw_params = []
-
-        #print("--- Refining Parameter Assignment (configure_optimizers) ---")
-
-        # List patterns within 'blocks' known not to receive gradients or that shouldn't be optimized by Muon
-        # Note: '.weight'/'.bias' suffixes are often needed for precise matching.
-        muon_exclude_patterns = [
-            'attn.intra_block_pos_encoding', # Unused or detached
-            'attn.importance_scorer.weight', # Used with non-differentiable topk
-            'attn.importance_scorer.bias',   # Used with non-differentiable topk
-            'attn.block_compressor',         # Unused or detached
-            # 'ffn.expert_bias', # This is already handled by the requires_grad check below
-        ]
-
-        for name, param in self.named_parameters():
-            # 1. Only consider parameters that require gradients
-            if not param.requires_grad:
-                #print(f"Skipping (requires_grad=False): {name}")
-                continue # Skip parameters like expert_bias
-
-            is_excluded = False
-            # 2. Check if the parameter name contains any of the explicit exclusion patterns
-            for pattern in muon_exclude_patterns:
-                if pattern in name:
-                    is_excluded = True
-                    #print(f"Excluding from Muon (known non-grad pattern): {name}")
-                    break # Stop checking patterns once excluded
-
-            #print(f"Processing: {name}, Dim: {param.ndim}, Requires Grad: {param.requires_grad}, Excluded: {is_excluded}")
-
-            # 3. Assign to Muon if: in blocks, >= 2D, AND not explicitly excluded
-            if 'blocks' in name and param.ndim >= 2 and not is_excluded:
-                #print(f"  -> Assigning to Muon: {name}")
-                muon_params.append(param)
+            if temperature == 0:  # Greedy sampling
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
             else:
-                # Assign to AdamW if: not in blocks, or < 2D, or explicitly excluded
-                #print(f"  -> Assigning to AdamW: {name}")
-                adamw_params.append(param)
+                logits = logits / temperature
+                if tiktoken_vocab_size is not None and tiktoken_vocab_size < self.config['vocab_size']:
+                    logits[:, tiktoken_vocab_size:] = float('-inf')
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float('-inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
 
+            idx = torch.cat((idx, idx_next), dim=1)
+        self.train()
+        return idx, 0.0  # KV cache size is 0 for this PE
 
-        #print("--- Final Parameter Group Counts ---")
-        num_muon_params = sum(p.numel() for p in muon_params)
-        num_adamw_params = sum(p.numel() for p in adamw_params)
-        print(f"num Muon parameters: {num_muon_params:,}")
-        print(f"num AdamW parameters: {num_adamw_params:,}")
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        decay_params = [p for n, p in self.named_parameters() if p.requires_grad and p.ndim >= 2]
+        nodecay_params = [p for n, p in self.named_parameters() if p.requires_grad and p.ndim < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        fused_available = False
+        if device_type == 'cuda':  # Check if CUDA is the device type string
+            fused_available = hasattr(torch.optim, '_fused_adamw') or hasattr(torch.optim, 'AdamW_fused_available')
+            if hasattr(torch.optim, 'AdamW_fused_available'): fused_available = torch.optim.AdamW_fused_available()
 
-        # Defensive check: Ensure Muon doesn't get an empty list
-        if not muon_params:
-             print("\n\n*** WARNING: Muon parameter list is EMPTY after filtering! ***")
-             print("This might be due to incorrect exclusion patterns or model structure.")
-             print("Proceeding with only the AdamW optimizer.")
-             # Return only AdamW optimizer in a list for consistent return type
-             optimizers = [
-                 torch.optim.AdamW(adamw_params, lr=learning_rate, betas=(0.90, 0.95), weight_decay=weight_decay)
-             ]
-        else:
-            optimizers = [
-                Muon(muon_params, lr=0.02, momentum=0.95, rank=0, world_size=1),
-                torch.optim.AdamW(adamw_params, lr=learning_rate, betas=(0.90, 0.95), weight_decay=weight_decay)
-            ]
+        use_fused = fused_available and device_type == 'cuda'
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), fused=use_fused)
+        print(f"Using Fused AdamW: {use_fused}")
+        return [optimizer]
 
-        return optimizers
+    def update_expert_biases(self, all_router_weights_list, update_rate):
+        # This method would need careful alignment with how DSMoE handles biases for load balancing
+        # For now, it's a placeholder as the current DSMoE uses softmax probabilities directly
+        pass
 
-    def update_expert_biases(self, all_router_weights, update_rate):
-
-        with torch.no_grad():
-            # Iterate through the blocks and find MoE layers
-
-            j = 0 
-
-            for block in self.blocks:
-                if isinstance(block.ffn, DSMoE):
-
-                    router_weights = all_router_weights[j]
-                    j += 1
-
-                    c_i = router_weights[:, 1:].sum(dim=0)  # Exclude shared expert, calculate expert load
-                    total_routed_tokens = c_i.sum()
-                    c_i_bar = total_routed_tokens / (block.ffn.num_experts - 1) # avg load
-                    e_i = c_i - c_i_bar # Load violation error
-
-                    block.ffn.expert_bias.add_(update_rate * torch.sign(e_i)) # update step
-
-    def estimate_mfu(self, params, fwdbwd_per_iter, dt):
-        N = params
-        L, H, Q, T = config['n_layer'], config['n_head'], config['n_embd']//config['n_head'], config['ctx_len']
-        flops_per_token = 6*N + 12*L*H*Q*T # fix recalc for MoE
-        flops_per_fwdbwd = flops_per_token * T
+    def estimate_mfu(self, num_params, fwdbwd_per_iter, dt):
+        N = num_params
+        T = self.config['ctx_len']
+        flops_per_token = 6 * N
+        flops_per_fwdbwd = flops_per_token * T * 3
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 65e12 # 65 tflops for a t4
+        flops_achieved = flops_per_iter / dt
+        flops_promised = 65e12
         mfu = flops_achieved / flops_promised
         return mfu
+
+
+# --- Main Test Case ---
+if __name__ == "__main__":
+    device = config['device']
+    print(f"Using device: {device}")
+
+    model = Transformer().to(device)
+
+    print("\nTesting forward pass...")
+    test_idx = torch.randint(0, config['vocab_size'], (2, 32), device=device)
+    test_targets = torch.randint(0, config['vocab_size'], (2, 32), device=device)
+
+    logits, loss, router_weights_list = model(test_idx, test_targets)
+    print(f"Logits shape: {logits.shape}")
+    if loss is not None: print(f"Loss: {loss.item():.4f}")
+    if router_weights_list:
+        print(f"Num MoE router weights sets: {len(router_weights_list)}")
+        for i, r_w in enumerate(router_weights_list): print(f"  MoE {i} weights shape: {r_w.shape}")
+    print("Forward pass test OK.")
+
+    print("\nTesting generation...")
+    prompt = torch.tensor([[1, 2, 3]], dtype=torch.long, device=device)
+    generated_output, kv_cache_gb = model.generate(prompt, max_new_tokens=5, temperature=0.0)  # Greedy
+    print(f"Generated sequence shape: {generated_output.shape}")
+    print(f"Generated sequence: {generated_output.tolist()}")
+    print("Generation test OK.")
+
+    print("\nTesting optimizer...")
+    optimizers = model.configure_optimizers(weight_decay=0.1, learning_rate=1e-4, device_type=str(device))
+    print(f"Num optimizer groups: {len(optimizers)}")
+    print("Optimizer test OK.")
+
+    print("\nTesting MFU...")
+    mfu = model.estimate_mfu(model.total_params, fwdbwd_per_iter=4, dt=1.0)
+    print(f"Estimated MFU: {mfu * 100:.2f}%")
+    print("MFU test OK.")
+
+    if hasattr(model.blocks[0].attn, 'pos_encoder'):
+        print("\nVisualizing initial PE filters...")
+        plt.figure(figsize=(15, 3 * (model.blocks[0].attn.pos_encoder.num_filters // 4 + 1)))  # Adjust height
+        pos_encoder_module = model.blocks[0].attn.pos_encoder
+        for i, filter_module in enumerate(pos_encoder_module.filters):
+            coeffs = filter_module.coeffs.detach().cpu().numpy()
+            plt.subplot((model.blocks[0].attn.pos_encoder.num_filters // 4 + 1), 4, i + 1)  # Dynamic subplot
+            plt.plot(coeffs)
+            title_str = f"Filter {i + 1}"
+            if hasattr(filter_module, 'init_cutoff_val'):
+                title_str += f"\n(Init: {filter_module.init_cutoff_val})"
+            plt.title(title_str)
+            plt.grid(True)
+        plt.suptitle("Initial FIR Filter Coefficients (First Attn Block PE)", fontsize=14)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig('integrated_model_filters_initial.png')
+        print("PE Filter visualization saved.")
+        plt.show()
