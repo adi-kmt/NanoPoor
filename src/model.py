@@ -313,11 +313,11 @@ class OrthonormalMultiHeadAttention(nn.Module):
         # Apply attention masks
         if is_causal:
             mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1e9)
+            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
 
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(attn_mask.unsqueeze(1), -1e9)
+                scores = scores.masked_fill(attn_mask.unsqueeze(1), torch.finfo(scores.dtype).min)
             else:
                 scores = scores + attn_mask
 
