@@ -75,7 +75,7 @@ model.config['ctx_len'] = args.ctx_len
 eval_interval = args.eval_interval
 grad_accum_steps = args.grad_accum  # Num microbatches
 
-lr = 3*args.lr # 3x lr, was in early ngpt spdrns
+lr = args.lr # 3x lr, was in early ngpt spdrns
 min_lr = args.min_lr # Now float
 
 max_iters = args.max_iters

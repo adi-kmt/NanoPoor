@@ -352,7 +352,7 @@ config = {
     'vocab_size': 50257,
     'n_layer': 12,
     'ctx_len': 1024,
-    'rms_norm_eps': 1e-5,
+    'rms_norm_eps': 1e-4,
     'type': ["mlp"] * 6 + ["moe"] * 6,  # Example layer types
     'n_experts': 4,  # For MoE
     'moe_top_k': 2,  # For MoE
